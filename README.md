@@ -238,6 +238,10 @@ Two constraints learned the hard way:
 - `examples/echo/bot.mjs` — HTTP transport, proving the engine needs no chat SDK.
 - `examples/discord/bot.mjs` — a working Discord bot: `npm i discord.js`, then
   `DISCORD_TOKEN=… DATABASE_URL=… PUBLIC_BASE_URL=… node examples/discord/bot.mjs`.
+- `examples/whatsapp/bot.mjs` — a working WhatsApp bot:
+  `npm i whatsapp-web.js qrcode-terminal`, then
+  `WA_TRIGGER='!ai' PUBLIC_BASE_URL=… node examples/whatsapp/bot.mjs`.
+  First run prints a QR code; the session is kept in `./.wwebjs_auth`.
 
 ### Discord specifics
 
@@ -252,6 +256,24 @@ tested with a fake. What it handles for you:
 | Conversations | One per channel: `discord:<channelId>` |
 | Attachments | URLs collected for `materializeImages`; the runtime reads files |
 | Empty answers | Reports a failure, unlike the WhatsApp adapter which stays silent |
+
+### WhatsApp specifics
+
+The adapter injects the client, so `whatsapp-web.js` stays an optional peer and
+the tests run against a fake.
+
+| Concern | Behaviour |
+| --- | --- |
+| Addressing | `!ai` prefix (configurable), same as production |
+| The bot's own messages | Ignored via `fromMe`, including replies sent from your phone |
+| Status posts | Ignored via `isStatus` |
+| Groups | Speaker prefixed into the text; `conversationId` is the group JID |
+| Attachments | Image media downloaded as data URLs, including a quoted image |
+| Long replies | Split at 4,000 characters on paragraph, line, then space |
+| Failures | Silent, matching the production bot; the mirror records them |
+
+The adapter is transport only. Tenancy, quota, wallets and history compaction
+stay in the host app — a kit has no business knowing what a subscription is.
 
 ## Migrating the existing WhatsApp app
 
@@ -283,7 +305,7 @@ repo owns the runtime.
 | Attachment normalisation (data URL or link → path) | **Ready**, tested |
 | Adapter contract | **Ready**, covered by a test |
 | Postgres storage | **Ready**; memory works without it |
-| WhatsApp adapter | **Sketch** — transport mapping only; tenancy, quota and VCC stay in the host app |
+| WhatsApp adapter | **Ready** — `adapters/whatsapp/index.js`, trigger, groups, attachments and chunking covered by tests |
 | Discord adapter | **Ready** — `adapters/discord/index.js`, chunking and mention handling covered by tests |
 | Site publishing | **Ready** but optional; needs `SITE_PUBLIC_ROOT` and a sudo rule |
 
