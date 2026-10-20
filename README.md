@@ -7,14 +7,112 @@ lines each. WhatsApp is one adapter; Discord is another; a CLI is a third.
 Extracted from a production WhatsApp bot after the same machinery kept being
 rewritten per platform.
 
+## Architecture
+
+```text
+┌────────────────┐  message   ┌─────────────────────────────────────────────┐
+│ WhatsApp       │───────────►│                ChatRuntime                  │
+│ Discord        │            │  serialises turns per conversation          │
+│ HTTP / CLI     │◄───────────│                                             │
+└────────────────┘   reply    │  1. queue the turn                          │
+       ▲                      │  2. open a progress mirror                  │
+       │ progress link        │  3. prompt DSH, stream its events           │
+       │                      │  4. publish any site the turn built         │
+       │                      │  5. close the mirror with the answer        │
+       │                      └──────────────┬──────────────────────────────┘
+       │                                     │ stdio JSON-RPC
+       │                                     ▼
+       │                      ┌─────────────────────────────────────────────┐
+       │                      │  dsh --profile <name>   (one process)       │
+       │                      │  one session per conversationId             │
+       │                      │  tools: bash, files, web, subagents, jobs   │
+       │                      │  emits: reasoning, tool calls, results      │
+       │                      └──────────────┬──────────────────────────────┘
+       │                                     │ events
+       │                                     ▼
+       │                      ┌─────────────────────────────────────────────┐
+       │                      │  mirror-store                               │
+       │                      │  redact → clip → persist (Postgres / memory)│
+       │                      │  → notify subscribers                       │
+       │                      └──────────────┬──────────────────────────────┘
+       │                                     │ SSE
+       └─────────────────────────────────────┴───► progress page (browser)
+```
+
+### The pieces
+
+| Module | Role | Depends on |
+| --- | --- | --- |
+| `adapters/*` | Platform transport: receive, address, chunk, send | A chat SDK, injected by the host |
+| `chat-runtime.js` | Turn queue, mirror lifecycle, publish hook, failure policy | The three below |
+| `dsh-client.js` | Spawn and drive one `dsh` process; map raw events to a neutral shape | Nothing |
+| `mirror-store.js` | Record events, redact secrets, expire, fan out | A query function, or memory |
+| `mirror-routes.js` | Serve the page, its client asset, and the SSE stream | express |
+
+Only the adapter knows which platform it is. Everything to its right is shared.
+
+### One turn, end to end
+
+```text
+adapter receives "!ai build a page"
+  └─ handler({ conversationId, text, imagePaths })
+       └─ ChatRuntime.ask()
+            ├─ queue: a second message for this chat waits
+            ├─ openMirror(chatId)                → request_mirrors row
+            ├─ publish tick starts (every 5s)    → sites live during the turn
+            ├─ DshClient.prompt()
+            │    ├─ session/prompt over stdio
+            │    ├─ onEvent reasoning            → thinking row
+            │    ├─ onEvent tool_start           → row + request panel
+            │    ├─ onEvent tool_result          → row + response panel
+            │    ├─ onEvent job_start / finish   → background work row
+            │    ├─ onEvent subagent_*           → child rows, attributed
+            │    └─ turn/end                     → text, or empty → one retry
+            ├─ publish tick stops, final publish pass
+            └─ finishMirror({ answer, error })   → page closes with the result
+       └─ adapter.send(conversationId, result.text)
+```
+
+### Event mapping
+
+The runtime's wire events become five neutral kinds the store understands:
+
+| Wire event | Neutral event | Shown as |
+| --- | --- | --- |
+| `assistant/message` with reasoning blocks | `reasoning` | Thinking block (or "Subagent thinking") |
+| `tool/call` | `tool_start` | Tool row with its request |
+| `tool/result` | `tool_result` | Response panel, ok or error |
+| `job/registered`, `job/settled` | `job_start`, `job_finish` | Background job row |
+| `subagent.started`, `subagent.finished` | `subagent_start`, `subagent_finish` | Child rows, badged, counted |
+| `turn/end` | turn settles | Result, or one retry when empty |
+
+### Design rules the code follows
+
+1. **The runtime is the only stateful layer.** Adapters keep no conversation
+   state, so a restart loses nothing except in-flight turns.
+2. **One source of truth per conversation.** The DSH session log. A host must
+   not replay its own message table into it — two stores drift.
+3. **The progress page is a projection, never a control surface.** It reads
+   sanitized events and cannot execute anything.
+4. **A failed turn is silent or explicit, never a lie.** The adapter chooses;
+   the mirror records which happened.
+5. **Secrets are removed at write time,** not at render time, so a stored
+   payload is already safe to publish.
+
+### Why stdio rather than `dsh web`
+
+The web GUI's launch token is an owner credential for the whole host — every
+session, the filesystem, and a shell. That suits an operator and not a chat user.
+stdio keeps the runtime headless and lets the mirror expose exactly one request.
+
 ## What is reusable, and what is not
 
 | Piece | Portable? |
 | --- | --- |
 | `chat-runtime.js` — turn queue, mirror, publish, finish | **Yes**, no platform imports |
 | `dsh-client.js` — stdio JSON-RPC client, per-chat sessions | **Yes** |
-| `mirror-store.js` — progress records, redaction, SSE fan-out | **Yes**, needs Postgres |
-| `mirror-routes.js` + `public/mirror-client.js` — progress page | **Yes**, any express host |
+| `mirror-store.js` — progress records, redaction, SSE fan-out | **Yes**, needs Postgres optionally |
+| `mirror-routes.js` + `mirror-client.js` — progress page | **Yes**, any express host |
 | `publish-site.mjs` — copy a built site to a public root | **Yes**, paths configurable |
 | WhatsApp bot, quota/wallet, VCC compaction, tenant DB | **No** — stays in the app |
 
@@ -88,7 +186,7 @@ Chat SDKs deliver media in different shapes; the runtime only takes paths.
 // WhatsApp: base64 data URL
 const path = await materializeImage(msg.dataUrl, { dir: '/tmp/chat-in' });
 // Discord: attachment URL
-const path2 = await materializeImage(msg.attachments.first().url, { dir: '/tmp/chat-in' });
+const path2 = await materializeImage(msg.attachment.url, { dir: '/tmp/chat-in' });
 
 await bot.ask({ conversationId, text, imagePaths: [path] });
 ```
@@ -155,10 +253,6 @@ tested with a fake. What it handles for you:
 | Attachments | URLs collected for `materializeImages`; the runtime reads files |
 | Empty answers | Reports a failure, unlike the WhatsApp adapter which stays silent |
 
-## Licence
-
-MIT.
-
 ## Migrating the existing WhatsApp app
 
 The production bot still carries its own copies of `dsh-client`, `mirror-store`
@@ -178,6 +272,7 @@ repo owns the runtime.
 - Progress mirrors expire (6h default) and are capability URLs, not accounts.
   Anyone with a link can read that one request.
 - The mirror shows reasoning; do not enable it where reasoning must stay private.
+- Subagent limits are DSH defaults: depth 1, 8 concurrent children per tree.
 
 ## Is it ready for a new platform?
 
@@ -198,3 +293,7 @@ What you must supply for either platform:
 2. A **DSH_HOME** and workspace directory the runtime may write.
 3. For a hardened setup, a **separate OS user** for the runtime.
 4. An **express** host with a mount path for the mirror router.
+
+## Licence
+
+MIT.
