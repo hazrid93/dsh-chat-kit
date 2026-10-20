@@ -1,0 +1,22 @@
+{
+  "name": "dsh-chat-kit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Platform-neutral chat runtime on DeepSeek Harness: one turn engine, per-chat DSH sessions, live progress pages, pluggable adapters.",
+  "exports": {
+    ".": "./packages/core/src/chat-runtime.js",
+    "./store": "./packages/core/src/mirror-store.js",
+    "./client": "./packages/core/src/dsh-client.js",
+    "./routes": "./packages/core/src/mirror-routes.js",
+    "./mirror-client.js": "./packages/core/public/mirror-client.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "example": "node examples/echo/bot.mjs"
+  },
+  "dependencies": {
+    "express": "^5.3.0"
+  },
+  "license": "MIT"
+}
