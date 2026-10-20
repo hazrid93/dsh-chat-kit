@@ -20,7 +20,7 @@ const BOOT_TIMEOUT_MS = 45_000;
 /** Deterministic, filesystem-safe session id for a WhatsApp chat. */
 export function sessionIdFor(chatId) {
   const digest = createHash('sha256').update(String(chatId)).digest('hex').slice(0, 24);
-  return `chat-${digest}`;
+  return `wa-${digest}`;
 }
 
 export class DshClient {
@@ -46,6 +46,7 @@ export class DshClient {
     this.child = null;
     this.pending = new Map();
     this.turns = new Map(); // sessionId -> { resolve, events, text }
+    this.childToParent = new Map(); // childSessionId -> parentSessionId
     this.queues = new Map(); // sessionId -> tail promise
     this.nextId = 1;
     this.ready = null;
@@ -126,11 +127,49 @@ export class DshClient {
       return;
     }
 
+    // Subagent lifecycle arrives as its own notification, not as a session event.
+    if (message.method === 'subagent.started') {
+      const parent = this.turns.get(message.params?.parentSessionId);
+      if (message.params?.childSessionId && message.params?.parentSessionId) {
+        this.childToParent.set(message.params.childSessionId, message.params.parentSessionId);
+      }
+      parent?.onEvent?.({
+        type: 'subagent_start',
+        childSessionId: message.params?.childSessionId,
+      });
+      return;
+    }
+
+    if (message.method === 'subagent.finished') {
+      const parent = this.turns.get(message.params?.parentSessionId);
+      const text = (message.params?.lastAssistantMessage ?? [])
+        .filter((b) => b.type === 'text')
+        .map((b) => b.text)
+        .join('')
+        .trim();
+      if (message.params?.childSessionId) this.childToParent.delete(message.params.childSessionId);
+      parent?.onEvent?.({
+        type: 'subagent_finish',
+        childSessionId: message.params?.childSessionId,
+        status: message.params?.status,
+        result: text,
+      });
+      return;
+    }
+
     const event = message.params?.event;
     const sessionId = message.params?.sessionId;
     if (!event || !sessionId) return;
 
-    const turn = this.turns.get(sessionId);
+    let turn = this.turns.get(sessionId);
+
+    // A child session reports under its own id, which no turn owns. Attribute it
+    // to the parent that delegated it, otherwise subagent work is invisible.
+    if (!turn) {
+      const parentId = this.childToParent.get(sessionId);
+      turn = parentId ? this.turns.get(parentId) : undefined;
+      if (turn) turn.child = true;
+    }
     if (!turn) return;
 
     if (event.type === 'assistant/message') {
@@ -145,7 +184,7 @@ export class DshClient {
         .join('')
         .trim();
       if (reasoning) {
-        turn.onEvent?.({ type: 'reasoning', text: reasoning, step: event.data?.step, turn: event.data?.turn });
+        turn.onEvent?.({ type: 'reasoning', child: turn.child === true, text: reasoning, step: event.data?.step, turn: event.data?.turn });
       }
       return;
     }
@@ -155,6 +194,7 @@ export class DshClient {
       if (event.data?.callId) turn.callNames.set(event.data.callId, name);
       turn.onEvent?.({
         type: 'tool_start',
+        child: turn.child === true,
         tool: name,
         callId: event.data?.callId,
         arguments: event.data?.arguments,
@@ -162,8 +202,40 @@ export class DshClient {
       return;
     }
 
+    if (event.type === 'job/registered') {
+      // A bash call may background long work; the job notification is the only
+      // place that work is visible.
+      // Real shape: { jobId, kind, label, startedAt, toolCall }.
+      const d = event.data ?? {};
+      turn.onEvent?.({
+        type: 'job_start',
+        child: turn.child === true,
+        jobId: d.jobId,
+        command: d.label ?? '',
+        description: d.kind ? `${d.kind} job` : '',
+      });
+      return;
+    }
+
+    if (event.type === 'job/settled') {
+      const d = event.data ?? {};
+      turn.onEvent?.({
+        type: 'job_finish',
+        child: turn.child === true,
+        jobId: d.jobId,
+        status: String(d.status ?? (d.exitCode === 0 ? 'ok' : d.exitCode != null ? 'error' : 'ok')),
+        result: d.label ?? '',
+      });
+      return;
+    }
+
+    if (event.type === 'step/end') {
+      turn.onEvent?.({ type: 'step_finish', child: turn.child === true, step: event.data?.step });
+      return;
+    }
+
     if (event.type === 'step/start') {
-      turn.onEvent?.({ type: 'step_start', step: event.data?.step, turn: event.data?.turn });
+      turn.onEvent?.({ type: 'step_start', child: turn.child === true, step: event.data?.step, turn: event.data?.turn });
       return;
     }
 
@@ -176,7 +248,7 @@ export class DshClient {
         .map((b) => b.text)
         .join('');
       const failed = /^\s*(error|error:)/i.test(body);
-      turn.onEvent?.({ type: 'tool_result', tool: name, callId, status: failed ? 'error' : 'ok', result: body });
+      turn.onEvent?.({ type: 'tool_result', child: turn.child === true, tool: name, callId, status: failed ? 'error' : 'ok', result: body });
       return;
     }
 

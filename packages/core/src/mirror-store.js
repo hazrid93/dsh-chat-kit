@@ -46,19 +46,11 @@ const flushTimers = new Map();
 /** id -> Set of listeners, for pages watching a request live. */
 const subscribers = new Map();
 
-/** Injected by the host so this module never owns a pool. */
+/** Injected by src/database.js so this module never owns a second pool. */
 let query = null;
-let TABLES = { mirrors: 'request_mirrors' };
 
-/**
- * Give the store a query function and optional table names.
- *
- * @param {(sql: string, params?: unknown[]) => Promise<{rows: any[], rowCount: number|null}>} poolQuery
- * @param {{mirrors?: string}} [tables]
- */
-export function attachMirrorStore(poolQuery, tables = {}) {
+export function attachMirrorStore(poolQuery) {
   query = poolQuery;
-  TABLES = { ...TABLES, ...tables };
 }
 
 const db = () => query;
@@ -80,6 +72,7 @@ const DISPLAY_NAMES = {
   list_website_files: 'list_files',
   conversation_recall: 'recall_conversation',
   research_recall: 'recall_research',
+  job: 'job',
 };
 
 const displayName = (tool) => DISPLAY_NAMES[tool] ?? tool;
@@ -128,7 +121,7 @@ async function flush(id, pending) {
   if (!entry || !db()) return;
   try {
     await db()(
-      `UPDATE ${TABLES.mirrors}
+      `UPDATE whatsapp_request_mirrors
           SET events = $2::jsonb, answer = $3, done = $4, error = $5, finished_at = $6
         WHERE id = $1`,
       [
@@ -212,7 +205,7 @@ export async function openMirror({ chatId, question }) {
   if (db()) {
     try {
       await db()(
-        `INSERT INTO ${TABLES.mirrors} (id, chat_id, question, expires_at)
+        `INSERT INTO whatsapp_request_mirrors (id, chat_id, question, expires_at)
          VALUES ($1, $2, $3, NOW() + INTERVAL '6 hours')`,
         [id, entry.chatId, entry.question]
       );
@@ -244,13 +237,83 @@ export function recordMirrorEvent(id, event) {
   const at = Date.now();
   let changed = false;
 
-  if (event.type === 'reasoning') {
+  if (event.type === 'job_start' || event.type === 'job_finish') {
+    // Background jobs never appear as tool calls of their own: the bash call
+    // registers a job and returns. Without this the mirror hides long work.
+    if (event.type === 'job_start') {
+      entry.events.push({
+        kind: 'tool',
+        tool: 'job',
+        callId: event.jobId ?? null,
+        hint: String(event.description ?? event.command ?? '').slice(0, 60),
+        status: 'running',
+        at,
+        durationMs: null,
+        request: clip(redact(String(event.command ?? ''))),
+        response: '',
+      });
+    } else {
+      for (let i = entry.events.length - 1; i >= 0; i -= 1) {
+        const row = entry.events[i];
+        if (row.tool === 'job' && row.status === 'running') {
+          row.status = event.status === 'error' ? 'error' : 'ok';
+          row.durationMs = at - row.at;
+          row.response = clip(redact(String(event.result ?? '')));
+          break;
+        }
+      }
+    }
+    changed = true;
+  } else if (event.type === 'step_finish') {
+    // Per-step completion: close anything left running in that step.
+    for (const row of entry.events) {
+      if (row.status === 'running' && row.kind === 'tool') {
+        row.status = 'abandoned';
+        row.durationMs = at - row.at;
+      }
+    }
+    changed = true;
+  } else if (event.type === 'subagent_start') {
+    // The parent already logged its `subagent` tool call; that row is the one
+    // to enrich. Only add a row when the lifecycle arrives without it.
+    const open = [...entry.events].reverse().find((row) => row.tool === 'subagent' && row.status === 'running');
+    if (open) {
+      open.childSessionId = event.childSessionId ?? null;
+      open.hint = open.hint || 'child agent started';
+    } else {
+      entry.events.push({
+        kind: 'tool',
+        tool: 'subagent',
+        callId: null,
+        hint: 'child agent started',
+        status: 'running',
+        at,
+        durationMs: null,
+        request: '',
+        response: '',
+      });
+    }
+    changed = true;
+  } else if (event.type === 'subagent_finish') {
+    // Close the newest running subagent row.
+    for (let i = entry.events.length - 1; i >= 0; i -= 1) {
+      const row = entry.events[i];
+      if (row.tool === 'subagent' && row.status === 'running') {
+        row.status = event.status === 'error' ? 'error' : 'ok';
+        row.durationMs = at - row.at;
+        row.response = clip(redact(String(event.result ?? '')));
+        changed = true;
+        break;
+      }
+    }
+  } else if (event.type === 'reasoning') {
     const text = clip(redact(String(event.text ?? '').trim()));
     if (!text) return;
     // Reasoning is per step; keep it as its own trace row so the page reads in
     // order alongside the calls it produced.
     entry.events.push({
       kind: 'reasoning',
+      child: Boolean(event.child),
       tool: '',
       hint: '',
       status: 'ok',
@@ -266,6 +329,7 @@ export function recordMirrorEvent(id, event) {
     entry.events.push({
       kind: 'tool',
       tool: displayName(tool),
+      child: Boolean(event.child),
       callId: event.callId ?? null,
       hint: hintFrom(event.args),
       status: 'running',
@@ -349,7 +413,7 @@ export async function getMirror(id) {
   try {
     const { rows } = await db()(
       `SELECT id, question, events, answer, done, error, started_at, finished_at
-         FROM ${TABLES.mirrors}
+         FROM whatsapp_request_mirrors
         WHERE id = $1 AND expires_at > NOW()`,
       [key]
     );
@@ -395,9 +459,10 @@ function shape(entry) {
     question: entry.question,
     startedAt: entry.startedAt,
     finishedAt: entry.finishedAt,
-    events: entry.events.map(({ kind, tool, hint, status, at, durationMs, trace, request, response }) => ({
+    events: entry.events.map(({ kind, tool, child, hint, status, at, durationMs, trace, request, response }) => ({
       kind,
       tool,
+      child: Boolean(child),
       hint,
       status,
       at,
@@ -424,7 +489,7 @@ export async function sweepMirrors() {
   if (!db()) return 0;
   try {
     const { rowCount } = await db()(
-      `UPDATE ${TABLES.mirrors}
+      `UPDATE whatsapp_request_mirrors
           SET done = TRUE,
               error = TRUE,
               finished_at = COALESCE(finished_at, NOW()),
@@ -448,7 +513,7 @@ export async function sweepMirrors() {
 export async function pruneMirrors() {
   if (!db()) return 0;
   try {
-    const { rowCount } = await db()(`DELETE FROM ${TABLES.mirrors} WHERE expires_at < NOW()`);
+    const { rowCount } = await db()(`DELETE FROM whatsapp_request_mirrors WHERE expires_at < NOW()`);
     return rowCount ?? 0;
   } catch (error) {
     console.error('[Mirror] prune failed:', error.message);
