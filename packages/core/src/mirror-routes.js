@@ -232,7 +232,7 @@ ${mirror.done ? '' : '<meta name="mirror-live" content="1">'}
  */
 router.get('/mirror-client.js', (_req, res) => {
   res.type('application/javascript').set('Cache-Control', 'public, max-age=300');
-  res.sendFile(path.join(import.meta.dirname, '..', '..', 'public', 'mirror-client.js'));
+  res.sendFile(path.join(import.meta.dirname, '..', 'public', 'mirror-client.js'));
 });
 
 router.get('/mirror/:id', async (req, res) => {

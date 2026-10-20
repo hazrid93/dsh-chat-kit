@@ -9,7 +9,10 @@
     "./store": "./packages/core/src/mirror-store.js",
     "./client": "./packages/core/src/dsh-client.js",
     "./routes": "./packages/core/src/mirror-routes.js",
-    "./mirror-client.js": "./packages/core/public/mirror-client.js"
+    "./mirror-client.js": "./packages/core/public/mirror-client.js",
+    "./adapter.js": "./packages/core/src/adapter.js",
+    "./attachments.js": "./packages/core/src/attachments.js",
+    "./publish.js": "./packages/core/src/publish-site.mjs"
   },
   "scripts": {
     "test": "node --test",

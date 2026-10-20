@@ -60,7 +60,8 @@ Then:
 
 ```js
 import { ChatRuntime } from 'dsh-chat-kit';
-import { serve } from 'dsh-chat-kit/packages/core/src/adapter.js';
+import { serve } from 'dsh-chat-kit/adapter.js';
+import { materializeImage } from 'dsh-chat-kit/attachments.js';
 
 const bot = new ChatRuntime({
   dshBinary: '/usr/local/bin/dsh',
@@ -77,6 +78,20 @@ await serve(bot, discordAdapter);
 `{ text, mirrorUrl, sites }`, and a turn that fails returns `text: ''` — the
 adapter decides whether to say anything (the WhatsApp adapter stays silent on
 purpose).
+
+## Attachments
+
+Chat SDKs deliver media in different shapes; the runtime only takes paths.
+`materializeImage` normalises both common ones:
+
+```js
+// WhatsApp: base64 data URL
+const path = await materializeImage(msg.dataUrl, { dir: '/tmp/chat-in' });
+// Discord: attachment URL
+const path2 = await materializeImage(msg.attachments.first().url, { dir: '/tmp/chat-in' });
+
+await bot.ask({ conversationId, text, imagePaths: [path] });
+```
 
 ## Progress pages
 
@@ -147,3 +162,23 @@ repo owns the runtime.
 - Progress mirrors expire (6h default) and are capability URLs, not accounts.
   Anyone with a link can read that one request.
 - The mirror shows reasoning; do not enable it where reasoning must stay private.
+
+## Is it ready for a new platform?
+
+| Need | State |
+| --- | --- |
+| Turn engine, per-chat sessions, queueing | **Ready**, tested |
+| Progress mirror (page, live stream, client) | **Ready**, tested end to end |
+| Attachment normalisation (data URL or link → path) | **Ready**, tested |
+| Adapter contract | **Ready**, covered by a test |
+| Postgres storage | **Ready**; memory works without it |
+| WhatsApp adapter | **Sketch** — transport mapping only; tenancy, quota and VCC stay in the host app |
+| Discord adapter | **Sketch** — needs the 2,000-character chunking it documents |
+| Site publishing | **Ready** but optional; needs `SITE_PUBLIC_ROOT` and a sudo rule |
+
+What you must supply for either platform:
+
+1. A DSH **profile** with the tools you want (the kit does not ship one).
+2. A **DSH_HOME** and workspace directory the runtime may write.
+3. For a hardened setup, a **separate OS user** for the runtime.
+4. An **express** host with a mount path for the mirror router.
