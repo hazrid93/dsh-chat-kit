@@ -8,9 +8,15 @@ import express from 'express';
 import { ChatRuntime } from '../../packages/core/src/chat-runtime.js';
 import { attachMirrorStore } from '../../packages/core/src/mirror-store.js';
 
-const pg = (await import('pg')).default;
-const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
-attachMirrorStore((sql, params) => pool.query(sql, params));
+// Postgres is optional: without it the store keeps mirrors in memory and the
+// progress page works for the life of the process.
+if (process.env.DATABASE_URL) {
+  const pg = (await import('pg')).default;
+  const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+  attachMirrorStore((sql, params) => pool.query(sql, params));
+} else {
+  attachMirrorStore(null);
+}
 
 const bot = new ChatRuntime({
   dshBinary: process.env.DSH_BIN ?? 'dsh',
