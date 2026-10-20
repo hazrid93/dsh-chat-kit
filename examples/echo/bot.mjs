@@ -7,8 +7,8 @@
 import express from 'express';
 import { ChatRuntime } from '../../packages/core/src/chat-runtime.js';
 import { attachMirrorStore } from '../../packages/core/src/mirror-store.js';
-import pg from 'pg';
 
+const pg = (await import('pg')).default;
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 attachMirrorStore((sql, params) => pool.query(sql, params));
 

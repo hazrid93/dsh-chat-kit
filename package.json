@@ -22,5 +22,31 @@
   "dependencies": {
     "express": "^5.3.0"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "optionalDependencies": {
+    "pg": "^8.16.3"
+  },
+  "peerDependencies": {
+    "discord.js": "^14"
+  },
+  "peerDependenciesMeta": {
+    "discord.js": {
+      "optional": true
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hazrid93/dsh-chat-kit.git"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "chatbot",
+    "whatsapp",
+    "discord",
+    "agent"
+  ],
+  "engines": {
+    "node": ">=20"
+  }
 }
