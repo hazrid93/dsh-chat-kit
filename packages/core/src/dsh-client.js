@@ -254,12 +254,18 @@ export class DshClient {
 
     if (event.type === 'turn/end') {
       this.turns.delete(sessionId);
-      const reason = event.data?.reason?.kind;
       if (event.data?.reason?.kind === 'error') {
         turn.reject(new Error(event.data.reason.error?.message ?? 'dsh turn failed'));
-      } else {
-        turn.resolve({ text: turn.text, reason });
+        return;
       }
+      // A turn can stop cleanly without producing any text — the model returned
+      // an empty completion. Reporting that as success is how a chat goes silent
+      // while the progress page claims "Request finished".
+      turn.resolve({
+        text: turn.text,
+        reason: event.data?.reason?.kind,
+        empty: turn.text.length === 0,
+      });
     }
   }
 
@@ -294,6 +300,30 @@ export class DshClient {
     await this.start();
     const sessionId = sessionIdFor(chatId);
 
+    // A single retry for the one degenerate case: the turn stopped with no text.
+    // Anything else (error, timeout) propagates as before.
+    const first = await this._promptOnce({ sessionId, text, imagePaths, timeoutMs, onEvent });
+    if (!first.empty) return first;
+
+    const retryEvent = {
+      type: 'reasoning',
+      text: 'The previous reply came back empty. Asking once more for the answer.',
+    };
+    onEvent?.(retryEvent);
+
+    const second = await this._promptOnce({
+      sessionId,
+      text:
+        'Your previous reply was empty, so the user saw nothing. ' +
+        'Answer their last message now, in plain text, using what you already found.',
+      imagePaths: [],
+      timeoutMs,
+      onEvent,
+    });
+    return second.text ? { ...second, retried: true } : first;
+  }
+
+  async _promptOnce({ sessionId, text, imagePaths, timeoutMs, onEvent }) {
     return this._enqueue(sessionId, async () => {
       await this._resumeIfPersisted(sessionId);
 
