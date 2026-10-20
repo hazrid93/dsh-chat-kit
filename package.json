@@ -12,7 +12,8 @@
     "./mirror-client.js": "./packages/core/public/mirror-client.js",
     "./adapter.js": "./packages/core/src/adapter.js",
     "./attachments.js": "./packages/core/src/attachments.js",
-    "./publish.js": "./packages/core/src/publish-site.mjs"
+    "./publish.js": "./packages/core/src/publish-site.mjs",
+    "./adapters/discord": "./adapters/discord/index.js"
   },
   "scripts": {
     "test": "node --test",

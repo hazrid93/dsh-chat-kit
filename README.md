@@ -138,6 +138,22 @@ Two constraints learned the hard way:
 ## Examples
 
 - `examples/echo/bot.mjs` — HTTP transport, proving the engine needs no chat SDK.
+- `examples/discord/bot.mjs` — a working Discord bot: `npm i discord.js`, then
+  `DISCORD_TOKEN=… DATABASE_URL=… PUBLIC_BASE_URL=… node examples/discord/bot.mjs`.
+
+### Discord specifics
+
+The adapter does not import `discord.js`; the client is injected, so it is
+tested with a fake. What it handles for you:
+
+| Concern | Behaviour |
+| --- | --- |
+| Addressing | `!ai` prefix, plus @mention in guilds (`DISCORD_REQUIRE_MENTION=false` to disable) |
+| Self/bot messages | Ignored, including the bot's own replies |
+| 2,000-character cap | Split on paragraph, then line, then space boundaries |
+| Conversations | One per channel: `discord:<channelId>` |
+| Attachments | URLs collected for `materializeImages`; the runtime reads files |
+| Empty answers | Reports a failure, unlike the WhatsApp adapter which stays silent |
 
 ## Licence
 
@@ -173,7 +189,7 @@ repo owns the runtime.
 | Adapter contract | **Ready**, covered by a test |
 | Postgres storage | **Ready**; memory works without it |
 | WhatsApp adapter | **Sketch** — transport mapping only; tenancy, quota and VCC stay in the host app |
-| Discord adapter | **Sketch** — needs the 2,000-character chunking it documents |
+| Discord adapter | **Ready** — `adapters/discord/index.js`, chunking and mention handling covered by tests |
 | Site publishing | **Ready** but optional; needs `SITE_PUBLIC_ROOT` and a sudo rule |
 
 What you must supply for either platform:
