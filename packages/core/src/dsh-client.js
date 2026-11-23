@@ -9,6 +9,8 @@
  */
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 
 const BOOT_TIMEOUT_MS = 45_000;
@@ -44,9 +46,28 @@ export class DshClient {
     this.childToParent = new Map(); // childSessionId -> parentSessionId
     this.queues = new Map(); // sessionId -> tail promise
     this.epochs = new Map(); // chatId -> reset counter so resetChat opens a fresh session
+    this.resetStatePath = options.resetStatePath ? resolve(options.resetStatePath) : null;
+    if (this.resetStatePath && existsSync(this.resetStatePath)) {
+      try {
+        const saved = JSON.parse(readFileSync(this.resetStatePath, 'utf8'));
+        for (const [k, v] of Object.entries(saved)) {
+          if (Number.isInteger(v) && v > 0) this.epochs.set(k, v);
+        }
+      } catch (err) {
+        console.warn(`[DSH] Could not load reset state: ${err.message}`);
+      }
+    }
     this.nextId = 1;
     this.ready = null;
     this.stderrTail = [];
+  }
+
+  _persistResets() {
+    if (!this.resetStatePath) return;
+    mkdirSync(dirname(this.resetStatePath), { recursive: true });
+    const tmp = `${this.resetStatePath}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(Object.fromEntries(this.epochs)), { mode: 0o600 });
+    renameSync(tmp, this.resetStatePath);
   }
 
   _sessionId(chatId) {
@@ -58,7 +79,15 @@ export class DshClient {
   /** Start future turns for this conversation in a fresh session id. */
   resetChat(chatId) {
     const prevId = this._sessionId(chatId);
-    this.epochs.set(chatId, (this.epochs.get(chatId) ?? 0) + 1);
+    const prevEpoch = this.epochs.get(chatId) ?? 0;
+    this.epochs.set(chatId, prevEpoch + 1);
+    try {
+      this._persistResets();
+    } catch (error) {
+      if (prevEpoch > 0) this.epochs.set(chatId, prevEpoch);
+      else this.epochs.delete(chatId);
+      throw error;
+    }
     const active = this.turns.get(prevId);
     if (active) {
       this.turns.delete(prevId);

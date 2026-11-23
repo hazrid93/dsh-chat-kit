@@ -54,6 +54,7 @@ export class ChatRuntime {
       model: options.model,
       reasoningEffort: options.reasoningEffort,
       sessionPrefix: options.sessionPrefix,
+      resetStatePath: options.resetStatePath,
       env: options.env,
     });
     /** conversationId -> tail promise, so a chat handles one turn at a time. */
@@ -152,7 +153,13 @@ export class ChatRuntime {
     try {
       sites = publish ? await publish(startedAt).catch(() => []) : [];
       if (mirrorId) {
-        await finishMirror(mirrorId, { answer: reply, error: failed }).catch(() => {});
+        const formatted = typeof this.options.formatMirrorAnswer === 'function'
+          ? String(this.options.formatMirrorAnswer(reply) ?? '')
+          : reply;
+        await finishMirror(mirrorId, {
+          answer: formatted,
+          error: failed || formatted.trim().length === 0,
+        }).catch(() => {});
       }
     } finally {
       this.turnDrain.end(drainKey);

@@ -109,3 +109,22 @@ test('resetChat switches the conversation to a new session id', async () => {
     await client.stop();
   }
 });
+
+test('resetStatePath persists chat reset epochs across DshClient instances', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-reset-'));
+  const stateFile = join(dir, 'resets.json');
+  try {
+    const c1 = new DshClient({ command: process.execPath, profile: 'test', resetStatePath: stateFile });
+    const before = c1._sessionId('chat-a');
+    c1.resetChat('chat-a');
+    const after = c1._sessionId('chat-a');
+    assert.notEqual(before, after);
+    const c2 = new DshClient({ command: process.execPath, profile: 'test', resetStatePath: stateFile });
+    assert.equal(c2._sessionId('chat-a'), after);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
