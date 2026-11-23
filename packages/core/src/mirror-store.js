@@ -1,20 +1,12 @@
 /**
- * Read-only session mirror, persisted in Postgres.
+ * Read-only session mirror, persisted in Postgres (or memory when no DB is attached).
  *
- * DSH's own web GUI cannot be linked to a WhatsApp user: its launch token mints
- * an owner credential over every session on the host. This module keeps a small
- * projection instead — one turn's tool activity, addressed by an unguessable id,
- * expiring.
+ * Keeps a sanitized projection of one turn's activity — reasoning traces, tool
+ * calls with requests/responses, status and duration, advisor notes, and the
+ * final answer — addressed by an unguessable 24-hex id, expiring after 6 hours.
  *
- * What is stored, to make the page read like the DSH web session view: the
- * thinking trace, every tool call with its request and response, status and
- * duration, and the final answer.
- * What is still removed: credentials, tokens, emails, phone numbers, absolute
- * paths, and anything from another chat.
- *
- * Writes are coalesced: tool events arrive in bursts, and one UPDATE per event
- * would be chatter against the shared pool. A row is written at open, flushed at
- * most once per FLUSH_MS, and always on finish.
+ * Credentials, tokens, emails, phone numbers, and absolute paths are redacted
+ * at write time so stored payloads are safe to serve.
  */
 import { randomBytes } from 'node:crypto';
 
@@ -24,44 +16,51 @@ const MAX_ANSWER_CHARS = 4000;
 const MAX_HINT_CHARS = 80;
 const MAX_TRACE_CHARS = 6000;
 const MAX_EVENTS = 200;
+const FLUSH_MS = 700;
+const STALE_MS = 65 * 60 * 1000;
+const DEFAULT_TABLE = 'request_mirrors';
+const SAFE_TABLE = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
+const BOOT_SWEEP_NOTE = 'Interrupted when the bot restarted before this request finished.';
 
-/**
- * Budget for one request or response body. The session view wants the payload,
- * not a summary, but a fetched page can be hundreds of kilobytes, so the tail
- * is cut and the cut is stated.
- */
 function clip(text, limit = MAX_TRACE_CHARS) {
   const value = String(text ?? '');
   if (value.length <= limit) return value;
   return `${value.slice(0, limit)}\n…[${value.length - limit} more characters cut]`;
 }
 
-const FLUSH_MS = 700;
-// Must exceed the turn hard cap (LLM_HARD_CAP_MS, 1h) so a live turn is never stale.
-const STALE_MS = 65 * 60 * 1000;
-
-/** id -> entry, only while the request is live. Finished rows live in Postgres. */
+/** id -> entry while live (and retained in memory until TTL/eviction). */
 const live = new Map();
 const flushTimers = new Map();
-/** id -> Set of listeners, for pages watching a request live. */
+/** id -> Set of listeners for live SSE push. */
 const subscribers = new Map();
 
-/** Injected by src/database.js so this module never owns a second pool. */
 let query = null;
+let tableName = DEFAULT_TABLE;
 
-export function attachMirrorStore(poolQuery) {
+/**
+ * Inject a Postgres `query(sql, params)` function (or `null` for memory-only).
+ * Pass `{ tableName }` if an existing deployment uses a custom table name.
+ */
+export function attachMirrorStore(poolQuery, options = {}) {
   query = poolQuery;
+  if (options.tableName !== undefined) {
+    if (!SAFE_TABLE.test(String(options.tableName))) {
+      throw new Error(`Invalid mirror tableName: ${options.tableName}`);
+    }
+    tableName = String(options.tableName);
+  } else if (poolQuery === null) {
+    tableName = DEFAULT_TABLE;
+  }
+}
+
+export function getMirrorTableName() {
+  return tableName;
 }
 
 const db = () => query;
 
 const SAFE_TOOL = /^[A-Za-z0-9_.:-]{1,60}$/;
 
-/**
- * Wire names are historical (`ollama_web_search` predates the provider
- * abstraction) and mean nothing to a WhatsApp user, who only cares what the
- * agent did. Show intent, not the tool's internal name.
- */
 const DISPLAY_NAMES = {
   ollama_web_search: 'web_search',
   web_fetch_all: 'web_fetch',
@@ -77,35 +76,25 @@ const DISPLAY_NAMES = {
 
 const displayName = (tool) => DISPLAY_NAMES[tool] ?? tool;
 
-/**
- * Remove what must not appear on a public page: credentials, emails, phone
- * numbers, and absolute paths. Long values are clipped.
- */
 function scrub(value) {
   let text = String(value).replace(/\s+/g, ' ').trim();
   text = text.replace(/\b(sk|pk|rk)-[A-Za-z0-9_-]{8,}/g, '[redacted]');
   text = text.replace(/\b[A-Za-z0-9_-]{24,}\b/g, '[redacted]');
   text = text.replace(/[\w.+-]+@[\w-]+\.[\w.]+/g, '[email]');
   text = text.replace(/\+?\d[\d\s()-]{7,}\d/g, '[number]');
-  // Absolute filesystem paths only. A URL such as example.com/review stays read-
-  // able, because "what page was read" is the point of the hint.
   text = text.replace(/(?:^|\s)(\/(?:[\w.@-]+\/){1,}[\w.@-]*)/g, ' [path]');
   if (text.length > MAX_HINT_CHARS) text = `${text.slice(0, MAX_HINT_CHARS - 1)}…`;
   return text;
 }
 
-/**
- * A one-line hint a person may read. Raw arguments are never stored; this keeps
- * only the field that says what the call was about, then scrubs it.
- */
 function hintFrom(args) {
   if (!args || typeof args !== 'object') return '';
-  // Only fields that describe the call. File paths are deliberately absent:
-  // "what was read" does not need the location, and locations leak.
   const first = Array.isArray(args.urls) ? args.urls[0] : Array.isArray(args.queries) ? args.queries[0] : '';
-  const candidate =
-    args.query ?? args.url ?? first ?? args.title ?? args.prompt ?? args.project_name ?? args.name ?? '';
-  if (typeof candidate !== 'string' || !candidate.trim()) return '';
+  const candidate = [
+    args.query, args.url, first, args.title, args.prompt, args.project_name, args.name,
+    args.summary, args.description, args.skill, args.pattern,
+  ].find((value) => typeof value === 'string' && value.trim());
+  if (!candidate) return '';
   return scrub(candidate);
 }
 
@@ -115,13 +104,11 @@ async function flush(id, pending) {
     clearTimeout(timer);
     flushTimers.delete(id);
   }
-  // `pending` lets the caller flush an entry it is about to evict; reading from
-  // `live` alone would skip the final write after a delete.
   const entry = pending ?? live.get(id);
   if (!entry || !db()) return;
   try {
     await db()(
-      `UPDATE whatsapp_request_mirrors
+      `UPDATE ${tableName}
           SET events = $2::jsonb, answer = $3, done = $4, error = $5, finished_at = $6
         WHERE id = $1`,
       [
@@ -138,12 +125,6 @@ async function flush(id, pending) {
   }
 }
 
-/**
- * Wake every page watching this request.
- *
- * The page is updated by push, not by reloading: a reload resets scroll and
- * collapses the panels the reader just opened.
- */
 function notify(id) {
   const listeners = subscribers.get(id);
   if (!listeners) return;
@@ -159,7 +140,6 @@ function notify(id) {
   }
 }
 
-/** Watch one live request. Returns an unsubscribe function. */
 export function subscribeMirror(id, listener) {
   const key = String(id ?? '');
   if (!/^[a-f0-9]{24}$/.test(key)) return () => {};
@@ -182,11 +162,10 @@ function scheduleFlush(id) {
       flush(id);
     }, FLUSH_MS)
   );
-  // Never hold the process open for a status page.
   flushTimers.get(id).unref?.();
 }
 
-/** Open a mirror for one request. Returns the id used in the public URL. */
+/** Open a mirror for one request. Returns the 24-hex id used in the public URL. */
 export async function openMirror({ chatId, question }) {
   prune();
   const id = randomBytes(12).toString('hex');
@@ -205,7 +184,7 @@ export async function openMirror({ chatId, question }) {
   if (db()) {
     try {
       await db()(
-        `INSERT INTO whatsapp_request_mirrors (id, chat_id, question, expires_at)
+        `INSERT INTO ${tableName} (id, chat_id, question, expires_at)
          VALUES ($1, $2, $3, NOW() + INTERVAL '6 hours')`,
         [id, entry.chatId, entry.question]
       );
@@ -219,33 +198,69 @@ export async function openMirror({ chatId, question }) {
 }
 
 /**
- * Record one event. Every tool call is kept under its real name — someone
- * watching a long turn wants to know what actually ran, not a category.
+ * Record one sanitized event onto a mirror.
  *
  * Accepted shapes:
- *  - { type: 'tool_start',  tool, args }               → new running row
- *  - { type: 'tool_result', tool, status, durationMs } → settle the newest row
- *  - { type: 'step_start' } | { type: 'step/start' }   → "Thinking"
- *  - { type: 'tool/call', name }                       → DSH-shaped call
- * Anything else is dropped here, so reasoning never reaches the store.
+ *  - { type: 'reasoning', text, child }
+ *  - { type: 'tool_start' | 'tool/call', tool, callId, args, arguments, child }
+ *  - { type: 'tool_result', tool, callId, status, durationMs, result, child }
+ *  - { type: 'job_start' | 'job_finish', jobId, command, description, status, result }
+ *  - { type: 'subagent_start' | 'subagent_finish', childSessionId, status, result }
+ *  - { type: 'step_finish' }
+ *  - { type: 'advice' | 'followup', id, severity, text, child } (also accepted post-finish)
  */
 export function recordMirrorEvent(id, event) {
   const entry = live.get(id);
-  if (!entry || entry.done || !event) return;
+  if (!entry || !event) return;
+  if (entry.done && event.type !== 'advice' && event.type !== 'followup') return;
   if (entry.events.length >= MAX_EVENTS) return;
 
   const at = Date.now();
   let changed = false;
 
-  if (event.type === 'job_start' || event.type === 'job_finish') {
-    // Background jobs never appear as tool calls of their own: the bash call
-    // registers a job and returns. Without this the mirror hides long work.
+  if (event.type === 'advice') {
+    const text = clip(redact(String(event.text ?? '').trim()));
+    if (!text) return;
+    if (event.id && entry.events.some((row) => row.kind === 'advice' && row.callId === event.id)) return;
+    entry.events.push({
+      kind: 'advice',
+      child: Boolean(event.child),
+      tool: '',
+      callId: event.id ?? null,
+      hint: String(event.severity ?? 'nit'),
+      status: 'ok',
+      at,
+      durationMs: null,
+      trace: text,
+      request: '',
+      response: '',
+    });
+    changed = true;
+  } else if (event.type === 'followup') {
+    const text = clip(redact(String(event.text ?? '').trim()));
+    if (!text) return;
+    entry.events.push({
+      kind: 'followup',
+      child: Boolean(event.child),
+      tool: '',
+      callId: null,
+      hint: '',
+      status: 'ok',
+      at,
+      durationMs: null,
+      trace: text,
+      request: '',
+      response: '',
+    });
+    changed = true;
+  } else if (event.type === 'job_start' || event.type === 'job_finish') {
     if (event.type === 'job_start') {
       entry.events.push({
         kind: 'tool',
         tool: 'job',
+        child: Boolean(event.child),
         callId: event.jobId ?? null,
-        hint: String(event.description ?? event.command ?? '').slice(0, 60),
+        hint: scrub(String(event.description ?? event.command ?? '')).slice(0, 60),
         status: 'running',
         at,
         durationMs: null,
@@ -265,17 +280,14 @@ export function recordMirrorEvent(id, event) {
     }
     changed = true;
   } else if (event.type === 'step_finish') {
-    // Per-step completion: close anything left running in that step.
     for (const row of entry.events) {
-      if (row.status === 'running' && row.kind === 'tool') {
+      if (row.status === 'running' && row.kind === 'tool' && !row.child && row.tool !== 'subagent') {
         row.status = 'abandoned';
         row.durationMs = at - row.at;
       }
     }
     changed = true;
   } else if (event.type === 'subagent_start') {
-    // The parent already logged its `subagent` tool call; that row is the one
-    // to enrich. Only add a row when the lifecycle arrives without it.
     const open = [...entry.events].reverse().find((row) => row.tool === 'subagent' && row.status === 'running');
     if (open) {
       open.childSessionId = event.childSessionId ?? null;
@@ -284,6 +296,7 @@ export function recordMirrorEvent(id, event) {
       entry.events.push({
         kind: 'tool',
         tool: 'subagent',
+        child: false,
         callId: null,
         hint: 'child agent started',
         status: 'running',
@@ -295,7 +308,6 @@ export function recordMirrorEvent(id, event) {
     }
     changed = true;
   } else if (event.type === 'subagent_finish') {
-    // Close the newest running subagent row.
     for (let i = entry.events.length - 1; i >= 0; i -= 1) {
       const row = entry.events[i];
       if (row.tool === 'subagent' && row.status === 'running') {
@@ -309,8 +321,6 @@ export function recordMirrorEvent(id, event) {
   } else if (event.type === 'reasoning') {
     const text = clip(redact(String(event.text ?? '').trim()));
     if (!text) return;
-    // Reasoning is per step; keep it as its own trace row so the page reads in
-    // order alongside the calls it produced.
     entry.events.push({
       kind: 'reasoning',
       child: Boolean(event.child),
@@ -325,7 +335,6 @@ export function recordMirrorEvent(id, event) {
   } else if (event.type === 'tool_start' || event.type === 'tool/call') {
     const tool = String(event.tool ?? event.name ?? '').trim();
     if (!SAFE_TOOL.test(tool)) return;
-    // Each call is its own row: repeats are facts, not noise to collapse.
     entry.events.push({
       kind: 'tool',
       tool: displayName(tool),
@@ -353,9 +362,6 @@ export function recordMirrorEvent(id, event) {
       }
     }
   }
-  // step_start is deliberately not recorded: it used to add an empty
-  // "Thinking…" row, and real reasoning blocks now follow it. The running page
-  // already says "Still working" at the tail.
 
   if (changed) {
     notify(id);
@@ -363,12 +369,10 @@ export function recordMirrorEvent(id, event) {
   }
 }
 
-/** Close the mirror with the answer the user already received. */
 export function finishMirror(id, { answer, error = false } = {}) {
   const entry = live.get(id);
   if (!entry || entry.done) return;
   const at = Date.now();
-  // A tool still marked running never reported back. Say so; never invent a result.
   for (const row of entry.events) {
     if (row.status === 'running') {
       row.status = error ? 'error' : 'abandoned';
@@ -379,29 +383,16 @@ export function finishMirror(id, { answer, error = false } = {}) {
   entry.error = Boolean(error);
   entry.finishedAt = at;
   entry.answer = String(answer ?? '').slice(0, MAX_ANSWER_CHARS);
-  // Final state always reaches the database, even if a flush is pending. The
-  // entry stays resident until TTL or the entry cap reclaims it: deleting it
-  // here made a finished page vanish whenever the database was unavailable.
   const written = flush(id, entry);
   notify(id);
   return written.then(() => id);
 }
 
-/**
- * Accept the id as people actually paste it. Chat clients glue trailing
- * punctuation to a link (`…69dd_`, `…69dd.`, `…69dd)`), and a copied address
- * must keep working rather than 404 on one stray character.
- */
 function normalizeId(value) {
   const match = String(value ?? '').toLowerCase().match(/[a-f0-9]{24}/);
   return match ? match[0] : null;
 }
 
-/**
- * Read one mirror for display. Live requests come from memory; finished ones
- * come from Postgres, so a link survives a restart. The unguessable id is the
- * credential, the same trust model as the existing web-chat history route.
- */
 export async function getMirror(id) {
   const key = normalizeId(id);
   if (!key) return null;
@@ -413,7 +404,7 @@ export async function getMirror(id) {
   try {
     const { rows } = await db()(
       `SELECT id, question, events, answer, done, error, started_at, finished_at
-         FROM whatsapp_request_mirrors
+         FROM ${tableName}
         WHERE id = $1 AND expires_at > NOW()`,
       [key]
     );
@@ -425,9 +416,6 @@ export async function getMirror(id) {
     let error = row.error;
     let finishedAt = row.finished_at ? new Date(row.finished_at).getTime() : null;
 
-    // Fallback for a writer that died before sweepMirrors could run: a request
-    // older than the turn hard cap cannot still be running. Show it as stopped
-    // instead of a page that refreshes forever.
     if (!done && Date.now() - startedAt > STALE_MS) {
       done = true;
       error = true;
@@ -477,21 +465,15 @@ function shape(entry) {
   };
 }
 
-/**
- * Settle rows a dead process left behind.
- *
- * A turn killed mid-flight (restart, crash, OOM) never reaches finishMirror, so
- * its row keeps done=false and leaves tool rows stuck on "running" forever.
- * Called once at bot startup, when nothing can still be running: this process
- * is the only writer.
- */
+/** Settle rows a dead process left behind, explaining why the turn stopped. */
 export async function sweepMirrors() {
   if (!db()) return 0;
   try {
     const { rowCount } = await db()(
-      `UPDATE whatsapp_request_mirrors
+      `UPDATE ${tableName}
           SET done = TRUE,
               error = TRUE,
+              answer = CASE WHEN length(answer) = 0 THEN $1 ELSE answer END,
               finished_at = COALESCE(finished_at, NOW()),
               events = COALESCE((
                 SELECT jsonb_agg(
@@ -500,7 +482,8 @@ export async function sweepMirrors() {
                               ELSE e END)
                   FROM jsonb_array_elements(events) AS e
               ), '[]'::jsonb)
-        WHERE done = FALSE`
+        WHERE done = FALSE`,
+      [BOOT_SWEEP_NOTE]
     );
     return rowCount ?? 0;
   } catch (error) {
@@ -509,11 +492,10 @@ export async function sweepMirrors() {
   }
 }
 
-/** Drop expired rows. One cron call a day is enough. */
 export async function pruneMirrors() {
   if (!db()) return 0;
   try {
-    const { rowCount } = await db()(`DELETE FROM whatsapp_request_mirrors WHERE expires_at < NOW()`);
+    const { rowCount } = await db()(`DELETE FROM ${tableName} WHERE expires_at < NOW()`);
     return rowCount ?? 0;
   } catch (error) {
     console.error('[Mirror] prune failed:', error.message);
@@ -521,14 +503,6 @@ export async function pruneMirrors() {
   }
 }
 
-/** Trim the in-memory map if a turn crashed before finishMirror ran. */
-/**
- * Redact secrets from a payload before it is published.
- *
- * The page now shows arguments and results, so this runs on every trace. It is
- * deliberately blunt: a missed token on a public URL is worse than a redacted
- * harmless id.
- */
 function redact(text) {
   let out = String(text ?? '');
   out = out.replace(/\b(sk|pk|rk|ghp|gho|xox[baprs])[-_][A-Za-z0-9_-]{8,}/g, '[redacted-key]');
@@ -555,4 +529,4 @@ function prune() {
   }
 }
 
-export const mirrorConfig = { TTL_MS, MAX_ENTRIES, MAX_EVENTS, FLUSH_MS };
+export const mirrorConfig = { TTL_MS, MAX_ENTRIES, MAX_EVENTS, FLUSH_MS, DEFAULT_TABLE };

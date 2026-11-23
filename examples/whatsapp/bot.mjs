@@ -90,7 +90,7 @@ client.on('ready', () => console.log('[whatsapp] ready'));
 client.on('auth_failure', (m) => console.error('[whatsapp] auth failed:', m));
 
 async function shutdown() {
-  await bot.close();
+  await bot.close({ drainMs: 30_000 });
   await client.destroy().catch(() => {});
   process.exit(0);
 }

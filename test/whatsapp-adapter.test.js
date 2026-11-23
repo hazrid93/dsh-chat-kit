@@ -100,3 +100,40 @@ test('long replies are chunked under the limit', async () => {
   assert.ok(sent.length > 1);
   for (const { text } of sent) assert.ok(text.length <= MAX_MESSAGE_CHARS);
 });
+
+test('replying to a quoted image collects the image even when current message has no media', async () => {
+  const { client, emit } = fakeWhatsApp();
+  const got = [];
+  await createWhatsAppAdapter({ client }).start(async (m) => got.push(m));
+  emit({
+    hasMedia: false,
+    hasQuotedMsg: true,
+    getQuotedMessage: async () => ({
+      hasMedia: true,
+      downloadMedia: async () => ({ mimetype: 'image/png', data: PNG.split(',')[1] }),
+    }),
+  });
+  await wait();
+  assert.equal(got.length, 1);
+  assert.equal(got[0].attachments.length, 1);
+  assert.match(got[0].attachments[0], /^data:image\/png;base64,/);
+});
+
+test('isAllowed gate blocks locked groups and Markdown is formatted for WhatsApp', async () => {
+  const { client, sent, emit } = fakeWhatsApp();
+  const got = [];
+  const adapter = createWhatsAppAdapter({
+    client,
+    isAllowed: ({ isGroup }) => !isGroup,
+  });
+  await adapter.start(async (m) => got.push(m));
+  emit({
+    from: 'locked@g.us',
+    getChat: async () => ({ id: { _serialized: 'locked@g.us' }, isGroup: true }),
+  });
+  await wait();
+  assert.equal(got.length, 0);
+
+  await adapter.send('user1@c.us', '## Summary\nCheck **bold** and [docs](https://example.com)');
+  assert.equal(sent[0].text, '*Summary*\nCheck *bold* and docs (https://example.com)');
+});

@@ -76,3 +76,27 @@ test('the stream pushes an event as it happens', async () => {
   assert.equal(last.answer, 'done');
   assert.ok(last.events.some((e) => e.tool === 'bash'));
 });
+
+test('subagent badges, subagent count, and advisor notes render in HTML', async () => {
+  const sid = await openMirror({ chatId: 'sub', question: 'subagent render test' });
+  recordMirrorEvent(sid, { type: 'tool_start', tool: 'web_search', callId: 'c1', child: true, args: { query: 'test' } });
+  recordMirrorEvent(sid, { type: 'tool_result', callId: 'c1', child: true, status: 'ok', result: 'found' });
+  await finishMirror(sid, { answer: 'final' });
+  recordMirrorEvent(sid, { type: 'advice', id: 'adv-1', severity: 'concern', text: 'double check edge case' });
+
+  const res = await fetch(`${base}/chat/mirror/${sid}`);
+  const html = await res.text();
+  assert.match(html, /class="child">subagent<\/span>/);
+  assert.match(html, /by subagents/);
+  assert.match(html, /Advisor · concern/);
+  assert.match(html, /double check edge case/);
+});
+
+test('a finished mirror with no answer renders No reply instead of empty Result', async () => {
+  const eid = await openMirror({ chatId: 'empty-ans', question: 'no reply test' });
+  await finishMirror(eid, { answer: '', error: true });
+  const res = await fetch(`${base}/chat/mirror/${eid}`);
+  const html = await res.text();
+  assert.match(html, /<h2>No reply<\/h2>/);
+  assert.doesNotMatch(html, /<h2>Result<\/h2>/);
+});

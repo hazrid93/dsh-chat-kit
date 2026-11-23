@@ -47,3 +47,34 @@ test('unknown and malformed ids resolve to null', async () => {
   assert.equal(await getMirror('nope'), null);
   assert.equal(await getMirror(''), null);
 });
+
+test('SQL queries use request_mirrors by default matching sql/mirrors.sql', async () => {
+  const seenSql = [];
+  attachMirrorStore(async (sql) => {
+    seenSql.push(sql);
+    return { rows: [], rowCount: 1 };
+  });
+  try {
+    const id = await openMirror({ chatId: 'c4', question: 'sql check' });
+    await finishMirror(id, { answer: 'ok' });
+    assert.ok(seenSql.some((s) => s.includes('INSERT INTO request_mirrors')));
+    assert.ok(seenSql.some((s) => s.includes('UPDATE request_mirrors')));
+    assert.ok(seenSql.every((s) => !s.includes('whatsapp_request_mirrors')));
+  } finally {
+    attachMirrorStore(null);
+  }
+});
+
+test('advisor notes are accepted after finishMirror and Droid hint fields work', async () => {
+  attachMirrorStore(null);
+  const id = await openMirror({ chatId: 'c5', question: 'hints' });
+  recordMirrorEvent(id, { type: 'tool_start', tool: 'Execute', callId: 'e1', args: { summary: 'list project files' } });
+  recordMirrorEvent(id, { type: 'tool_result', callId: 'e1', status: 'ok', result: 'ok' });
+  await finishMirror(id, { answer: 'done' });
+  recordMirrorEvent(id, { type: 'advice', id: 'a1', severity: 'nit', text: 'add tests' });
+
+  const m = await getMirror(id);
+  assert.equal(m.events[0].hint, 'list project files');
+  assert.equal(m.events[1].kind, 'advice');
+  assert.equal(m.events[1].trace, 'add tests');
+});

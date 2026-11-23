@@ -1,12 +1,8 @@
 /**
- * Public read-only mirror page for one DSH request.
+ * Public read-only mirror page for one chat request.
  *
- * Reachable at /api/chat/mirror/:id — the id is a 24-hex capability token,
- * so no login is needed (same trust model as the existing history route) but
- * the page exposes only what mirror-store.js recorded.
- *
- * Served under /api/ so nginx routes it to this app; see
- * docs/DSH_SESSION_MIRROR.md for the routing note.
+ * Reachable at <mount>/mirror/:id — the id is a 24-hex capability token,
+ * so no login is needed, and the page exposes only what mirror-store.js recorded.
  */
 import { Router } from 'express';
 import path from 'node:path';
@@ -22,24 +18,17 @@ const escapeHtml = (value) =>
 
 const seconds = (from, to) => Math.max(0, Math.round((to - from) / 1000));
 
-/**
- * Cheap change detector for a snapshot. Event count plus the newest timestamp
- * plus the done flag is enough: a step that only updates a duration still
- * changes the timestamp of its row.
- */
 const signatureOf = (m) =>
   `${m.events.length}:${m.events.at(-1)?.at ?? 0}:${m.done ? 1 : 0}:${m.finishedAt ?? 0}`;
 
-/**
- * Metrics for the header. Counts read the same way the rows do, so a reader can
- * check "3 tools, 1 failed" against what the trace shows.
- */
 function metricsOf(mirror) {
   const events = mirror.events ?? [];
   const tools = events.filter((e) => e.kind === 'tool');
   const failed = tools.filter((e) => e.status === 'error').length;
   const abandoned = tools.filter((e) => e.status === 'abandoned').length;
   const thinking = events.filter((e) => e.kind === 'reasoning').length;
+  const advice = events.filter((e) => e.kind === 'advice').length;
+  const childSteps = events.filter((e) => e.child).length;
   const toolMs = tools.reduce((sum, e) => sum + (e.durationMs ?? 0), 0);
   const end = mirror.finishedAt ?? Date.now();
   const elapsed = Math.max(mirror.events?.length ? 1 : 0, Math.round((end - mirror.startedAt) / 1000));
@@ -50,8 +39,10 @@ function metricsOf(mirror) {
     failed,
     abandoned,
     thinking,
+    advice,
     toolSeconds: Math.round(toolMs / 1000),
     steps: events.length,
+    childSteps,
     waitingOn: !mirror.done && last?.status === 'running' ? last.tool : '',
   };
 }
@@ -66,29 +57,43 @@ function statsHtml(mirror) {
     m.failed ? cell(m.failed, 'failed', 'bad') : '',
     m.abandoned ? cell(m.abandoned, 'cut off') : '',
     cell(m.thinking, 'thinking'),
+    m.advice ? cell(m.advice, 'advisor') : '',
     cell(`${m.toolSeconds}s`, 'in tools'),
+    m.childSteps ? cell(m.childSteps, 'by subagents') : '',
   ].join('');
 }
 
 function renderPage(mirror, base = '') {
   const end = mirror.finishedAt ?? Date.now();
-  // A row written directly (or read back from Postgres) can lack a useful
-  // start time; never render a negative or zero-length duration as history.
   const elapsed = Math.max(mirror.events.length ? 1 : 0, seconds(mirror.startedAt, end));
   const rows = mirror.events
     .map((event) => {
       const offset = seconds(mirror.startedAt, event.at);
 
+      if (event.kind === 'advice') {
+        return `<li class="step advice"><span class="dot"></span>
+          <div class="body"><div class="head"><span class="who">Advisor · ${escapeHtml(event.hint || 'note')}</span><span class="at">${offset}s</span></div>
+          <div class="trace">${escapeHtml(event.trace || '')}</div></div></li>`;
+      }
+
+      if (event.kind === 'followup') {
+        return `<li class="step followup"><span class="dot"></span>
+          <div class="body"><div class="head"><span class="who">Follow-up after advice</span><span class="at">${offset}s</span></div>
+          <div class="trace">${escapeHtml(event.trace || '')}</div></div></li>`;
+      }
+
       if (event.kind === 'reasoning' || event.kind === 'thinking') {
         const trace = event.trace ? escapeHtml(event.trace) : 'Thinking…';
+        const who = event.child ? 'Subagent thinking' : 'Thinking';
         return `<li class="step reasoning"><span class="dot"></span>
-          <div class="body"><div class="head"><span class="who">Thinking</span><span class="at">${offset}s</span></div>
+          <div class="body"><div class="head"><span class="who">${who}</span><span class="at">${offset}s</span></div>
           <div class="trace">${trace}</div></div></li>`;
       }
 
       const took =
         event.durationMs == null ? '' : `${Math.max(1, Math.round(event.durationMs / 1000))}s`;
       const hint = event.hint ? ` <span class="hint">${escapeHtml(event.hint)}</span>` : '';
+      const child = event.child ? '<span class="child">subagent</span>' : '';
       const request = event.request
         ? `<details><summary>request</summary><pre>${escapeHtml(event.request)}</pre></details>`
         : '';
@@ -100,7 +105,7 @@ function renderPage(mirror, base = '') {
         <span class="dot"></span>
         <div class="body">
           <div class="head">
-            <code>${escapeHtml(event.tool)}</code>${hint}
+            ${child}<code>${escapeHtml(event.tool)}</code>${hint}
             <span class="at">${escapeHtml(event.status)}${took ? ` · ${took}` : ''}</span>
           </div>
           ${detail}
@@ -123,16 +128,12 @@ ${mirror.done ? '' : '<meta name="mirror-live" content="1">'}
   html, body { height: 100%; }
   body { margin: 0; background: #0b0f14; color: #e8eef6;
          font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-
-  /* Fixed viewport: header and footer stay put, the trace scrolls between them. */
   main { height: 100dvh; display: flex; flex-direction: column;
          width: min(56rem, 100%); margin: 0 auto; }
-
   header { flex: none; padding: 1rem 1.25rem .75rem; border-bottom: 1px solid var(--edge); }
   h1 { margin: 0 0 .2rem; font-size: 1.05rem; font-weight: 600; }
   .q { margin: 0; color: var(--muted); font-size: .9rem; overflow: hidden;
        display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
-
   .stats { display: flex; flex-wrap: wrap; gap: .4rem; margin: .7rem 0 0; }
   .stat { display: flex; align-items: baseline; gap: .35rem; padding: .2rem .55rem;
           border: 1px solid var(--edge); border-radius: 999px; background: #0f151d; }
@@ -140,17 +141,15 @@ ${mirror.done ? '' : '<meta name="mirror-live" content="1">'}
   .stat span { color: var(--dim); font-size: .72rem; text-transform: uppercase; letter-spacing: .04em; }
   .stat.bad b { color: #eb5757; }
   .stat.good b { color: #27ae60; }
-
   .scroll { flex: 1 1 auto; overflow-y: auto; overscroll-behavior: contain;
             padding: .5rem 1.25rem 1rem; scrollbar-gutter: stable; }
   .scroll:focus-visible { outline: 2px solid #2f80ed; outline-offset: -2px; }
-
   ol { list-style: none; margin: 0; padding: 0; }
   .step { display: flex; align-items: flex-start; gap: .75rem; padding: .55rem 0;
           border-bottom: 1px solid var(--edge); font-size: .95rem; }
   .step .dot { margin-top: .45rem; }
   .body { flex: 1; min-width: 0; }
-  .head { display: flex; align-items: baseline; gap: .5rem; }
+  .head { display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap; }
   .who { color: #9db2c8; font-size: .9rem; }
   .head .at { margin-left: auto; }
   .trace { margin: .35rem 0 0; padding: .6rem .75rem; border-left: 2px solid #2a3a4d;
@@ -168,27 +167,30 @@ ${mirror.done ? '' : '<meta name="mirror-live" content="1">'}
   .step.abandoned .dot { background: #6b7c91; }
   .step.running .dot { animation: pulse 1.1s ease-in-out infinite; }
   .step.reasoning .dot { background: #7c5cff; }
+  .step.advice .dot { background: #f2c14e; }
+  .step.followup .dot { background: #4dc3ff; }
+  .step.followup .trace { border-left-color: #4dc3ff; color: #a9d6ea; }
+  .step.advice .trace { border-left-color: #f2c14e; color: #d9c9a3; }
   code { font: .85em/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
          background: #16202c; border: 1px solid #22303f; border-radius: .3rem; padding: .1rem .35rem; }
   .hint { color: var(--muted); font-size: .88em; }
+  .child { font-size: .68rem; text-transform: uppercase; letter-spacing: .05em;
+           color: #b997ff; border: 1px solid #3b2f5c; background: #1a1430;
+           border-radius: .25rem; padding: .05rem .3rem; }
   .label { flex: 1; }
   .at { color: var(--dim); font-size: .85rem; font-variant-numeric: tabular-nums; }
   .answer { white-space: pre-wrap; margin: .35rem 0 0; padding: 1rem; border-radius: .6rem;
             background: #121a24; border: 1px solid var(--edge); font-size: .95rem; }
   #result h2 { margin: 1.5rem 0 .5rem; font-size: 1rem; font-weight: 600; }
-
   footer { flex: none; padding: .6rem 1.25rem; border-top: 1px solid var(--edge);
            color: #5b6b7f; font-size: .8rem; display: flex; gap: .75rem; align-items: center; }
   footer .spacer { flex: 1; }
-
-  /* Jump-to-latest, shown only while the reader is scrolled up. */
   #jump { position: fixed; right: 1.25rem; bottom: 4.25rem; width: 2.75rem; height: 2.75rem;
           border-radius: 50%; border: 1px solid #2a3a4d; background: #16202c; color: #e8eef6;
           font-size: 1.15rem; cursor: pointer; display: grid; place-items: center;
           box-shadow: 0 6px 20px rgba(0,0,0,.45); transition: opacity .15s, transform .15s; }
   #jump[hidden] { display: none; }
   #jump:hover { background: #1d2a38; transform: translateY(-1px); }
-
   @keyframes pulse { 50% { opacity: .25; } }
   @media (prefers-reduced-motion: reduce) {
     .step.running .dot { animation: none; }
@@ -206,7 +208,7 @@ ${mirror.done ? '' : '<meta name="mirror-live" content="1">'}
 
   <div class="scroll" id="scroll" tabindex="0">
     <ol id="steps">${rows}${mirror.done ? '' : `<li class="step running"><span class="dot"></span><span class="label">Still working</span><span class="at">${elapsed}s</span></li>`}</ol>
-    <div id="result">${mirror.done && mirror.answer ? `<h2>Result</h2><p class="answer">${escapeHtml(mirror.answer)}</p>` : ''}</div>
+    <div id="result">${mirror.done ? (mirror.answer ? `<h2>Result</h2><p class="answer">${escapeHtml(mirror.answer)}</p>` : '<h2>No reply</h2><p class="answer">The turn ended without producing an answer, so nothing was sent to the chat.</p>') : ''}</div>
   </div>
 
   <footer>
@@ -222,16 +224,8 @@ ${mirror.done ? '' : '<meta name="mirror-live" content="1">'}
 </html>`;
 }
 
-/**
- * The page's client script, served as a file.
- *
- * helmet's default Content-Security-Policy is `script-src 'self'`, which blocks
- * an inline <script> outright — the page rendered but never went live. Serving
- * it here keeps the strict policy intact instead of weakening it with
- * 'unsafe-inline'.
- */
 router.get('/mirror-client.js', (_req, res) => {
-  res.type('application/javascript').set('Cache-Control', 'public, max-age=300');
+  res.type('application/javascript').set('Cache-Control', 'no-store, max-age=0');
   res.sendFile(path.join(import.meta.dirname, '..', 'public', 'mirror-client.js'));
 });
 
@@ -241,13 +235,6 @@ router.get('/mirror/:id', async (req, res) => {
   res.type('html').set('Cache-Control', 'no-store, max-age=0').send(renderPage(mirror, req.baseUrl));
 });
 
-/**
- * Live updates for one request (server-sent events).
- *
- * The page is pushed the whole event list on every change and redraws in place.
- * A reload would jump the scroll and collapse open panels; this does not.
- * nginx already sets `proxy_buffering off` for /api/chat/, so no header games.
- */
 router.get('/mirror/:id/stream', async (req, res) => {
   const mirror = await getMirror(req.params.id);
   if (!mirror) return res.status(404).end();
@@ -266,13 +253,6 @@ router.get('/mirror/:id/stream', async (req, res) => {
   send(mirror);
   if (mirror.done) return res.end();
 
-  // Two sources, because they cover different processes.
-  //
-  // `subscribeMirror` is instant but in-process: the turn runs in the bot, whose
-  // memory this server cannot see, so its notify() never reaches this stream.
-  // The store flushes to Postgres every ~700ms, so polling that row is what
-  // actually delivers live updates here. The subscription stays as the fast
-  // path for any turn this process itself wrote.
   let signature = signatureOf(mirror);
 
   const push = (snapshot) => {
@@ -286,6 +266,8 @@ router.get('/mirror/:id/stream', async (req, res) => {
   const unsubscribe = subscribeMirror(mirror.id, (snapshot) => {
     const finished = push(snapshot) && snapshot.done;
     if (finished) {
+      clearInterval(poll);
+      clearInterval(heartbeat);
       unsubscribe();
       res.end();
     }
@@ -297,13 +279,13 @@ router.get('/mirror/:id/stream', async (req, res) => {
     const sent = push(snapshot);
     if (sent && snapshot.done) {
       clearInterval(poll);
+      clearInterval(heartbeat);
       unsubscribe();
       res.end();
     }
   }, 1000);
   poll.unref?.();
 
-  // Keeps proxies and browsers from dropping an otherwise idle stream.
   const heartbeat = setInterval(() => res.write(': ping\n\n'), 15_000);
   heartbeat.unref?.();
 
@@ -314,7 +296,6 @@ router.get('/mirror/:id/stream', async (req, res) => {
   });
 });
 
-/** JSON form, for the WhatsApp layer or a dashboard to poll. */
 router.get('/mirror/:id/json', async (req, res) => {
   const mirror = await getMirror(req.params.id);
   if (!mirror) return res.status(404).json({ error: 'expired or unknown' });

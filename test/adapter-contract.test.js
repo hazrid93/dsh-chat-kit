@@ -57,3 +57,34 @@ test('a failed turn stays silent unless the adapter opts into errors', async () 
   await deliverToBot({ conversationId: 'room:3', text: 'hi' });
   assert.equal(errorSent.length, 1);
 });
+
+test('serve materializes attachments, emits typing, and calls sendProgress', async () => {
+  const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  const asks = [];
+  const bot = {
+    async ask(input) {
+      asks.push(input);
+      input.onMirrorOpened?.('https://x/chat/mirror/abc', 'abc');
+      return { text: 'ok', mirrorUrl: 'https://x/chat/mirror/abc', sites: [] };
+    },
+  };
+  let deliver;
+  const typed = [];
+  const progress = [];
+  const sent = [];
+  const adapter = {
+    name: 'rich',
+    async start(h) { deliver = h; },
+    async typing(id) { typed.push(id); },
+    async sendProgress(id, url) { progress.push({ id, url }); },
+    async send(id, text) { sent.push({ id, text }); },
+  };
+  await serve(bot, adapter, { typingIntervalMs: 0 });
+  await deliver({ conversationId: 'room:4', text: 'look', attachments: [PNG] });
+  assert.equal(asks.length, 1);
+  assert.equal(asks[0].imagePaths.length, 1);
+  assert.match(asks[0].imagePaths[0], /\.png$/);
+  assert.deepEqual(typed, ['room:4']);
+  assert.deepEqual(progress, [{ id: 'room:4', url: 'https://x/chat/mirror/abc' }]);
+  assert.deepEqual(sent, [{ id: 'room:4', text: 'ok' }]);
+});

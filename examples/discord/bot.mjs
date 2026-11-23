@@ -91,7 +91,7 @@ if (process.env.MIRROR_PORT) {
 }
 
 async function shutdown() {
-  await bot.close();
+  await bot.close({ drainMs: 30_000 });
   await client.destroy();
   process.exit(0);
 }

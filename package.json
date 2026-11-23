@@ -13,6 +13,7 @@
     "./adapter.js": "./packages/core/src/adapter.js",
     "./attachments.js": "./packages/core/src/attachments.js",
     "./publish.js": "./packages/core/src/publish-site.mjs",
+    "./drain.js": "./packages/core/src/turn-drain.js",
     "./adapters/discord": "./adapters/discord/index.js",
     "./adapters/whatsapp": "./adapters/whatsapp/index.js"
   },

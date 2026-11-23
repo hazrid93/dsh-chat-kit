@@ -43,4 +43,7 @@ app.post('/ask', express.json(), async (req, res) => {
   res.json(result);
 });
 
-app.listen(3100, () => console.log('echo adapter on http://localhost:3100'));
+const srv = app.listen(3100, () => console.log('echo adapter on http://localhost:3100'));
+const shutdown = async () => { srv.close(); await bot.close({ drainMs: 15_000 }); process.exit(0); };
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
